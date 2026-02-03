@@ -1,9 +1,9 @@
-name: Build LuaJIT + Luv (CMake)
+name: Build LuaJIT + Luv (Robust)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 0' # Every Sunday
+    - cron: '0 0 * * 0'
   push:
     tags:
       - 'v*'
@@ -22,9 +22,7 @@ jobs:
       - name: Get Upstream Commit Hashes
         id: get_hashes
         run: |
-          # We track luvit/luv because it contains LuaJIT as a submodule
           LUV_SHA=$(git ls-remote https://github.com/luvit/luv.git HEAD | awk '{ print $1 }')
-          
           INFO="Built from luvit/luv@${LUV_SHA:0:7}"
           echo "Current Upstream: $INFO"
           echo "info=$INFO" >> $GITHUB_OUTPUT
@@ -37,10 +35,8 @@ jobs:
         run: |
           OLD_BODY=$(gh release view latest --json body -q .body 2>/dev/null || echo "First Run")
           if [[ "$OLD_BODY" == *"$NEW_INFO"* ]]; then
-            echo "Hashes match. No new versions found."
             echo "should_build=false" >> $GITHUB_OUTPUT
           else
-            echo "New versions detected!"
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
 
@@ -67,62 +63,92 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Clone Luv (Recursive to get LuaJIT)
+      # 1. Clone Luv (Recursive to get LuaJIT source)
       - name: Clone luvit/luv
         run: git clone --recursive https://github.com/luvit/luv.git build_work
 
-      # 2. Configure & Build (Linux/Mac)
-      - name: Build (Unix)
+      # ---------------------------------------------------------
+      # STEP A: Build LuaJIT Executable (Native Method)
+      # ---------------------------------------------------------
+      
+      - name: Build LuaJIT Executable (Unix)
+        if: matrix.platform != 'windows'
+        run: |
+          cd build_work/deps/luajit
+          # Standard Makefile build - guarantees 'src/luajit' exists
+          make -j2
+        shell: bash
+
+      - name: Build LuaJIT Executable (Windows)
+        if: matrix.platform == 'windows'
+        # Windows requires the MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1 
+        with:
+          arch: x64
+      
+      - name: Run MSVC Build (Windows)
+        if: matrix.platform == 'windows'
+        run: |
+          cd build_work/deps/luajit/src
+          # Standard Batch build - guarantees 'src/luajit.exe' exists
+          .\msvcbuild.bat
+        shell: cmd
+
+      # ---------------------------------------------------------
+      # STEP B: Build Luv Module (CMake Method)
+      # ---------------------------------------------------------
+
+      - name: Build Luv (Unix)
         if: matrix.platform != 'windows'
         run: |
           cd build_work
-          # Configure CMake to build LuaJIT bundled
           cmake -S . -B build -DWITH_LUA_ENGINE=LuaJIT -DBUILD_MODULE=ON -DBUILD_SHARED_LIBS=OFF
-          # Compile
           cmake --build build --config Release
         shell: bash
 
-      # 3. Configure & Build (Windows)
-      - name: Build (Windows)
+      - name: Build Luv (Windows)
         if: matrix.platform == 'windows'
         run: |
           cd build_work
-          # Windows needs specific flags to ensure we get the DLLs right
           cmake -S . -B build -DWITH_LUA_ENGINE=LuaJIT -DBUILD_MODULE=ON -DBUILD_SHARED_LIBS=OFF
           cmake --build build --config Release
         shell: bash
 
-      # 4. Organize Artifacts (Create the "Tree")
+      # ---------------------------------------------------------
+      # STEP C: Package & Zip
+      # ---------------------------------------------------------
+
       - name: Package Artifacts
         shell: bash
         run: |
           mkdir -p dist/bin
           mkdir -p dist/lib/lua/5.1
           
-          # --- WINDOWS ---
-          if [[ "${{ matrix.platform }}" == "windows" ]]; then
-            # Copy Executable and Lua DLL
-            cp build_work/build/deps/luajit/src/luajit.exe dist/bin/
-            cp build_work/build/deps/luajit/src/lua51.dll dist/bin/
-            # Copy Luv DLL (Renaming if needed)
-            # CMake on Windows might output 'luv.dll' or 'libluv.dll' in Release folder
-            cp build_work/build/Release/luv.dll dist/lib/lua/5.1/ 2>/dev/null || cp build_work/build/luv.dll dist/lib/lua/5.1/
-          fi
+          echo "--- Copying Artifacts for ${{ matrix.platform }} ---"
 
-          # --- LINUX / MAC ---
-          if [[ "${{ matrix.platform }}" != "windows" ]]; then
-            # Copy Executable
-            cp build_work/build/deps/luajit/src/luajit dist/bin/
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            # 1. LuaJIT Executable (From Native Build)
+            cp build_work/deps/luajit/src/luajit.exe dist/bin/
+            cp build_work/deps/luajit/src/lua51.dll dist/bin/
             
-            # Copy Luv SO (Finding the right name)
-            # Mac usually produces luv.so or luv.dylib
-            cp build_work/build/luv.so dist/lib/lua/5.1/ 2>/dev/null || cp build_work/build/libluv.so dist/lib/lua/5.1/luv.so
+            # 2. Luv DLL (From CMake Build)
+            # Find it wherever CMake put it (Release folder or root)
+            find build_work/build -name "luv.dll" -exec cp {} dist/lib/lua/5.1/ \;
+          else
+            # 1. LuaJIT Executable (From Native Build)
+            cp build_work/deps/luajit/src/luajit dist/bin/
+            
+            # 2. Luv SO (From CMake Build)
+            # Find luv.so or libluv.so and rename/move it
+            find build_work/build -name "luv.so" -exec cp {} dist/lib/lua/5.1/ \; -o -name "libluv.so" -exec cp {} dist/lib/lua/5.1/luv.so \;
+            
+            # Fix Mac Dylib extension if needed
+            find build_work/build -name "libluv.dylib" -exec cp {} dist/lib/lua/5.1/luv.so \;
           fi
           
-          # Verify structure
+          echo "--- Contents of dist ---"
           ls -R dist
 
-      # 5. Zip
       - name: Zip Release
         shell: bash
         run: |
@@ -133,14 +159,13 @@ jobs:
              zip -r ../${{ matrix.asset_name }}.zip .
           fi
 
-      # 6. Upload
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: latest
           name: Latest Automated Build
           body: |
-            Automated build of LuaJIT + Luv (from source).
+            Automated build of LuaJIT + Luv.
             ${{ needs.check-versions.outputs.version_info }}
           files: ${{ matrix.asset_name }}.zip
           draft: false
