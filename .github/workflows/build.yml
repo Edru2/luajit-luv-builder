@@ -1,12 +1,15 @@
-name: Build LuaJIT + Luv
+name: Build LuaJIT + Luv (CMake)
 
 on:
-  workflow_dispatch:        # Manual trigger
+  workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 0'     # Check every Sunday at Midnight
+    - cron: '0 0 * * 0' # Every Sunday
+  push:
+    tags:
+      - 'v*'
 
 permissions:
-  contents: write           # Required to create Releases
+  contents: write
 
 jobs:
   # --- JOB 1: CHECK FOR UPDATES ---
@@ -19,13 +22,10 @@ jobs:
       - name: Get Upstream Commit Hashes
         id: get_hashes
         run: |
-          # Query the latest commit hash (HEAD) for LuaJIT and Luv
-          LUAJIT_SHA=$(git ls-remote https://github.com/LuaJIT/LuaJIT.git HEAD | awk '{ print $1 }')
+          # We track luvit/luv because it contains LuaJIT as a submodule
           LUV_SHA=$(git ls-remote https://github.com/luvit/luv.git HEAD | awk '{ print $1 }')
           
-          # Create a signature string
-          INFO="Built from: LuaJIT@${LUAJIT_SHA:0:7} | Luv@${LUV_SHA:0:7}"
-          
+          INFO="Built from luvit/luv@${LUV_SHA:0:7}"
           echo "Current Upstream: $INFO"
           echo "info=$INFO" >> $GITHUB_OUTPUT
 
@@ -35,9 +35,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEW_INFO: ${{ steps.get_hashes.outputs.info }}
         run: |
-          # Try to get the body of the 'latest' release. If it fails (first run), output empty.
           OLD_BODY=$(gh release view latest --json body -q .body 2>/dev/null || echo "First Run")
-          
           if [[ "$OLD_BODY" == *"$NEW_INFO"* ]]; then
             echo "Hashes match. No new versions found."
             echo "should_build=false" >> $GITHUB_OUTPUT
@@ -46,7 +44,7 @@ jobs:
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
 
-  # --- JOB 2: BUILD (Only runs if 'should_build' is true) ---
+  # --- JOB 2: BUILD ---
   build:
     needs: check-versions
     if: needs.check-versions.outputs.should_build == 'true' || github.event_name == 'workflow_dispatch'
@@ -58,66 +56,92 @@ jobs:
         include:
           - os: ubuntu-latest
             asset_name: luajit-linux
-            setup_cmd: sudo apt-get update && sudo apt-get install -y cmake
+            platform: linux
           - os: macos-latest
             asset_name: luajit-mac
-            setup_cmd: brew install cmake
+            platform: mac
           - os: windows-latest
             asset_name: luajit-win
-            setup_cmd: echo "Windows setup"
+            platform: windows
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
+      # 1. Clone Luv (Recursive to get LuaJIT)
+      - name: Clone luvit/luv
+        run: git clone --recursive https://github.com/luvit/luv.git build_work
 
-      - name: Install Hererocks
-        run: pip install hererocks
-
-      # --- BUILD STEP ---
-      - name: Build LuaJIT 2.1 (Latest)
+      # 2. Configure & Build (Linux/Mac)
+      - name: Build (Unix)
+        if: matrix.platform != 'windows'
         run: |
-          hererocks runtime --luajit 2.1 -r latest
+          cd build_work
+          # Configure CMake to build LuaJIT bundled
+          cmake -S . -B build -DWITH_LUA_ENGINE=LuaJIT -DBUILD_MODULE=ON -DBUILD_SHARED_LIBS=OFF
+          # Compile
+          cmake --build build --config Release
         shell: bash
 
-      # --- INSTALL LUV ---
-      - name: Install Luv
+      # 3. Configure & Build (Windows)
+      - name: Build (Windows)
+        if: matrix.platform == 'windows'
         run: |
-          ./runtime/bin/luarocks install luv
+          cd build_work
+          # Windows needs specific flags to ensure we get the DLLs right
+          cmake -S . -B build -DWITH_LUA_ENGINE=LuaJIT -DBUILD_MODULE=ON -DBUILD_SHARED_LIBS=OFF
+          cmake --build build --config Release
         shell: bash
 
-      # --- CLEANUP ---
-      - name: Slim down distribution
-        run: |
-          rm -rf runtime/include runtime/share runtime/lib/pkgconfig
+      # 4. Organize Artifacts (Create the "Tree")
+      - name: Package Artifacts
         shell: bash
-
-      # --- ZIP ARTIFACTS ---
-      - name: Zip Runtime (Unix)
-        if: runner.os != 'Windows'
         run: |
-          mv runtime ${{ matrix.asset_name }}
-          zip -r ${{ matrix.asset_name }}.zip ${{ matrix.asset_name }}
+          mkdir -p dist/bin
+          mkdir -p dist/lib/lua/5.1
+          
+          # --- WINDOWS ---
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            # Copy Executable and Lua DLL
+            cp build_work/build/deps/luajit/src/luajit.exe dist/bin/
+            cp build_work/build/deps/luajit/src/lua51.dll dist/bin/
+            # Copy Luv DLL (Renaming if needed)
+            # CMake on Windows might output 'luv.dll' or 'libluv.dll' in Release folder
+            cp build_work/build/Release/luv.dll dist/lib/lua/5.1/ 2>/dev/null || cp build_work/build/luv.dll dist/lib/lua/5.1/
+          fi
 
-      - name: Zip Runtime (Windows)
-        if: runner.os == 'Windows'
+          # --- LINUX / MAC ---
+          if [[ "${{ matrix.platform }}" != "windows" ]]; then
+            # Copy Executable
+            cp build_work/build/deps/luajit/src/luajit dist/bin/
+            
+            # Copy Luv SO (Finding the right name)
+            # Mac usually produces luv.so or luv.dylib
+            cp build_work/build/luv.so dist/lib/lua/5.1/ 2>/dev/null || cp build_work/build/libluv.so dist/lib/lua/5.1/luv.so
+          fi
+          
+          # Verify structure
+          ls -R dist
+
+      # 5. Zip
+      - name: Zip Release
+        shell: bash
         run: |
-          Rename-Item -Path "runtime" -NewName "${{ matrix.asset_name }}"
-          Compress-Archive -Path "${{ matrix.asset_name }}" -DestinationPath "${{ matrix.asset_name }}.zip"
+          cd dist
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+             Compress-Archive -Path * -DestinationPath ../${{ matrix.asset_name }}.zip
+          else
+             zip -r ../${{ matrix.asset_name }}.zip .
+          fi
 
-      # --- RELEASE ---
+      # 6. Upload
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: latest
           name: Latest Automated Build
           body: |
-            Automated build of LuaJIT 2.1 + Luv.
+            Automated build of LuaJIT + Luv (from source).
             ${{ needs.check-versions.outputs.version_info }}
-            Build Date: ${{ github.event.repository.updated_at }}
           files: ${{ matrix.asset_name }}.zip
           draft: false
           prerelease: false
