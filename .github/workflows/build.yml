@@ -1,0 +1,124 @@
+name: Build LuaJIT + Luv
+
+on:
+  workflow_dispatch:        # Manual trigger
+  schedule:
+    - cron: '0 0 * * 0'     # Check every Sunday at Midnight
+
+permissions:
+  contents: write           # Required to create Releases
+
+jobs:
+  # --- JOB 1: CHECK FOR UPDATES ---
+  check-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.compare.outputs.should_build }}
+      version_info: ${{ steps.get_hashes.outputs.info }}
+    steps:
+      - name: Get Upstream Commit Hashes
+        id: get_hashes
+        run: |
+          # Query the latest commit hash (HEAD) for LuaJIT and Luv
+          LUAJIT_SHA=$(git ls-remote https://github.com/LuaJIT/LuaJIT.git HEAD | awk '{ print $1 }')
+          LUV_SHA=$(git ls-remote https://github.com/luvit/luv.git HEAD | awk '{ print $1 }')
+          
+          # Create a signature string
+          INFO="Built from: LuaJIT@${LUAJIT_SHA:0:7} | Luv@${LUV_SHA:0:7}"
+          
+          echo "Current Upstream: $INFO"
+          echo "info=$INFO" >> $GITHUB_OUTPUT
+
+      - name: Check Previous Release
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_INFO: ${{ steps.get_hashes.outputs.info }}
+        run: |
+          # Try to get the body of the 'latest' release. If it fails (first run), output empty.
+          OLD_BODY=$(gh release view latest --json body -q .body 2>/dev/null || echo "First Run")
+          
+          if [[ "$OLD_BODY" == *"$NEW_INFO"* ]]; then
+            echo "Hashes match. No new versions found."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "New versions detected!"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+  # --- JOB 2: BUILD (Only runs if 'should_build' is true) ---
+  build:
+    needs: check-versions
+    if: needs.check-versions.outputs.should_build == 'true' || github.event_name == 'workflow_dispatch'
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: luajit-linux
+            setup_cmd: sudo apt-get update && sudo apt-get install -y cmake
+          - os: macos-latest
+            asset_name: luajit-mac
+            setup_cmd: brew install cmake
+          - os: windows-latest
+            asset_name: luajit-win
+            setup_cmd: echo "Windows setup"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Hererocks
+        run: pip install hererocks
+
+      # --- BUILD STEP ---
+      - name: Build LuaJIT 2.1 (Latest)
+        run: |
+          hererocks runtime --luajit 2.1 -r latest
+        shell: bash
+
+      # --- INSTALL LUV ---
+      - name: Install Luv
+        run: |
+          ./runtime/bin/luarocks install luv
+        shell: bash
+
+      # --- CLEANUP ---
+      - name: Slim down distribution
+        run: |
+          rm -rf runtime/include runtime/share runtime/lib/pkgconfig
+        shell: bash
+
+      # --- ZIP ARTIFACTS ---
+      - name: Zip Runtime (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mv runtime ${{ matrix.asset_name }}
+          zip -r ${{ matrix.asset_name }}.zip ${{ matrix.asset_name }}
+
+      - name: Zip Runtime (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Rename-Item -Path "runtime" -NewName "${{ matrix.asset_name }}"
+          Compress-Archive -Path "${{ matrix.asset_name }}" -DestinationPath "${{ matrix.asset_name }}.zip"
+
+      # --- RELEASE ---
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: latest
+          name: Latest Automated Build
+          body: |
+            Automated build of LuaJIT 2.1 + Luv.
+            ${{ needs.check-versions.outputs.version_info }}
+            Build Date: ${{ github.event.repository.updated_at }}
+          files: ${{ matrix.asset_name }}.zip
+          draft: false
+          prerelease: false
+          overwrite: true
